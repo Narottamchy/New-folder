@@ -8,15 +8,17 @@ const app = express();
 const logger = require("./logger");
 
 const ses = new AWS.SES({ region: process.env.AWS_REGION });
+const s3 = new AWS.S3();
 
 const SENDERS = process.env.SENDERS.split(",");
 const SUBJECT = process.env.SUBJECT;
 const HTML_TEMPLATE_PATH = process.env.HTML_TEMPLATE_PATH;
-const EMAIL_CSV_PATH = process.env.EMAIL_CSV_PATH;
-const UNSUBSCRIBED_FILE = process.env.UNSUBSCRIBED_FILE;
 const MAX_TOTAL_EMAILS = parseInt(process.env.MAX_TOTAL_EMAILS, 10);
 const CONFIG_SET = process.env.CONFIG_SET;
 const NOTIFY_EMAIL = process.env.NOTIFY_EMAIL;
+const BUCKET_NAME = process.env.BUCKET_NAME;
+const EMAIL_CSV_KEY = process.env.EMAIL_CSV_KEY;
+const UNSUBSCRIBED_KEY = process.env.UNSUBSCRIBED_KEY;
 
 const STATE_PATH = path.resolve("data");
 const TOTAL_SENT_PATH = path.join(STATE_PATH, "total_sent.txt");
@@ -35,10 +37,15 @@ function fetchHtmlTemplate() {
   return fs.readFileSync(HTML_TEMPLATE_PATH, "utf8");
 }
 
-function loadUnsubscribedSet() {
+async function downloadS3FileToString(key) {
+  const result = await s3.getObject({ Bucket: BUCKET_NAME, Key: key }).promise();
+  return result.Body.toString("utf-8");
+}
+
+async function loadUnsubscribedSet() {
+  const data = await downloadS3FileToString(UNSUBSCRIBED_KEY);
   return new Set(
-    fs
-      .readFileSync(UNSUBSCRIBED_FILE, "utf8")
+    data
       .split("\n")
       .map((e) => e.trim().toLowerCase())
       .filter(Boolean)
@@ -70,36 +77,38 @@ async function sendEmail(source, to, subject, html) {
   }
 }
 
-function buildBatch(unsubSet, lastReceiver, limit) {
+async function buildBatch(unsubSet, lastReceiver, limit) {
+  const data = await downloadS3FileToString(EMAIL_CSV_KEY);
+  const lines = data.split("\n");
+  const headers = lines[0].split(",").map((h) => h.trim());
+  const emailIdx = headers.indexOf("Email");
+  const usernameIdx = headers.indexOf("Username");
+
   const recipients = [];
   let seen = !lastReceiver;
 
-  return new Promise((resolve, reject) => {
-    fs.createReadStream(EMAIL_CSV_PATH)
-      .pipe(csv())
-      .on("data", (row) => {
-        const email = row.Email?.trim();
-        const username = row.Username?.trim();
-        if (!email || !username || unsubSet.has(email.toLowerCase())) return;
+  for (let i = 1; i < lines.length && recipients.length < limit; i++) {
+    const values = lines[i].split(",");
+    const email = values[emailIdx]?.trim();
+    const username = values[usernameIdx]?.trim();
 
-        if (!seen) {
-          if (email === lastReceiver) seen = true;
-          return;
-        }
+    if (!email || !username || unsubSet.has(email.toLowerCase())) continue;
 
-        if (recipients.length < limit) {
-          recipients.push({ email, username });
-        }
-      })
-      .on("end", () => resolve(recipients))
-      .on("error", reject);
-  });
+    if (!seen) {
+      if (email === lastReceiver) seen = true;
+      continue;
+    }
+
+    recipients.push({ email, username });
+  }
+
+  return recipients;
 }
 
 app.post("/run-campaign", async (req, res) => {
   logger.info("Campaign start");
 
-  const unsubSet = loadUnsubscribedSet();
+  const unsubSet = await loadUnsubscribedSet();
   const totalSent = parseInt(readStateFile(TOTAL_SENT_PATH) || "0", 10);
   const lastReceiver = readStateFile(LAST_RECEIVER_PATH);
   const lastSender = readStateFile(LAST_SENDER_PATH);
@@ -139,7 +148,7 @@ app.post("/run-campaign", async (req, res) => {
 
   writeStateFile(TOTAL_SENT_PATH, (totalSent + sentCount).toString());
 
-  const adjusted = totalSent + sentCount + [...unsubSet].length;
+  const adjusted = totalSent + sentCount + unsubSet.size;
   logger.info(`Campaign progress: ${adjusted}/${MAX_TOTAL_EMAILS}`);
 
   const subject = adjusted >= MAX_TOTAL_EMAILS ? "✅ Email Batch Complete" : "⏳ Batch Incomplete";
