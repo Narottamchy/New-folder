@@ -61,6 +61,14 @@ app.get('/start-campaign', async (req, res) => {
     const emailCSV = await getObject(EMAIL_LIST_KEY);
     const recipients = await readCSVFromString(emailCSV);
 
+    // Calculate global unsub count
+    let globalUnsubCount = 0;
+    for (const r of recipients) {
+      if (r.Email && unsubscribed.has(r.Email.toLowerCase())) {
+        globalUnsubCount++;
+      }
+    }
+
     let startIdx = lastReceiver
       ? recipients.findIndex(r => r.Email === lastReceiver) + 1
       : 0;
@@ -94,7 +102,41 @@ app.get('/start-campaign', async (req, res) => {
       sentCount++;
     }
 
-    res.send(`✅ Sent ${sentCount} emails this run`);
+    // Adjusted completion check and notification
+    const MAX_TOTAL_EMAILS = parseInt(process.env.MAX_TOTAL_EMAILS || '12136');
+    const alreadySent = parseInt(readLocal('state/total_sent.txt') || '0');
+    const adjusted = alreadySent + globalUnsubCount;
+    logger.info(`Adjusted count: ${adjusted}/${MAX_TOTAL_EMAILS}`);
+
+    let notifySubject, notifyBody;
+    if (adjusted >= MAX_TOTAL_EMAILS) {
+      logger.info('Campaign complete, sending final notification.');
+      notifySubject = '✅ Email Batch Complete';
+      notifyBody = `<p>All ${MAX_TOTAL_EMAILS} emails accounted (sent + unsub=${adjusted}).</p>`;
+    } else {
+      logger.info('Not complete, sending progress notification.');
+      notifySubject = '⏳ Campaign Progress';
+      notifyBody = `<p>Sent ${alreadySent} + ${globalUnsubCount} unsub = ${adjusted}/${MAX_TOTAL_EMAILS}.</p>`;
+    }
+
+    // Send notification email using SES utility
+    if (NOTIFY_EMAIL) {
+      try {
+        await sendTemplateEmail({
+          to: NOTIFY_EMAIL,
+          from: senders[0],
+          templateData: {
+            SUBJECT: notifySubject,
+            BODY: notifyBody
+          }
+        });
+        logger.info(`Notification email sent to ${NOTIFY_EMAIL}`);
+      } catch (notifyErr) {
+        logger.error(`Failed to send notification email: ${notifyErr.message}`);
+      }
+    }
+
+    res.send(`✅ Sent ${sentCount} emails this run. Adjusted count: ${adjusted}/${MAX_TOTAL_EMAILS}`);
   } catch (err) {
     logger.error(`❌ Error: ${err.message}`);
     res.status(500).send('Internal Server Error');
