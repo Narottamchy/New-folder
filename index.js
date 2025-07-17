@@ -18,15 +18,15 @@ const {
 } = process.env;
 
 const senders = SENDERS.split(',');
+const app = express();
 
-// Load local state
+let isRunning = false; // Flag to prevent multiple runs
+
+// Helper functions
 const readLocal = (file) =>
   fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
 const writeLocal = (file, data) =>
   fs.writeFileSync(file, data, 'utf8');
-
-
-
 const readCSVFromString = (str) => {
   return new Promise((resolve) => {
     const results = [];
@@ -36,25 +36,29 @@ const readCSVFromString = (str) => {
       .on('end', () => resolve(results));
   });
 };
-
 const nextSender = (last) => {
   const idx = senders.indexOf(last);
   return idx === -1 ? senders[0] : senders[(idx + 1) % senders.length];
 };
 
+const campaignStatus = {
+  running: false,
+  totalSent: 0,
+  lastReceiver: '',
+  lastSender: '',
+  startTime: null,
+};
 
-
-const app = express();
-
-
-app.get('/start-campaign', async (req, res) => {
+// Main background function
+async function runCampaign(batchSize) {
   try {
-    const batchSize = parseInt(req.query.batchSize) || 100;
+    campaignStatus.running = true;
+    campaignStatus.startTime = new Date().toISOString();
+
     const lastReceiver = readLocal('state/last_receiver.txt');
     const lastSender = readLocal('state/last_sender.txt');
     const totalSent = parseInt(readLocal('state/total_sent.txt') || '0');
 
-    // Use S3 utility to get unsubscribed and email list
     const unsubscribed = new Set(
       (await getObject(UNSUBSCRIBED_KEY)).split('\n').map(e => e.trim().toLowerCase())
     );
@@ -77,7 +81,6 @@ app.get('/start-campaign', async (req, res) => {
         URL: `${UNSUBSCRIBE_URL}?email=${encodeURIComponent(r.Email)}`
       };
 
-      // Use SES utility to send email
       await sendTemplateEmail({
         to: r.Email,
         from: sender,
@@ -90,17 +93,41 @@ app.get('/start-campaign', async (req, res) => {
       writeLocal('state/last_sender.txt', sender);
       writeLocal('state/total_sent.txt', (totalSent + sentCount + 1).toString());
 
+      campaignStatus.lastReceiver = r.Email;
+      campaignStatus.lastSender = sender;
+      campaignStatus.totalSent = totalSent + sentCount + 1;
+
       sender = nextSender(sender);
       sentCount++;
     }
 
-    res.send(`✅ Sent ${sentCount} emails this run`);
+    logger.info(`✅ Completed batch: ${sentCount} emails sent`);
   } catch (err) {
-    logger.error(`❌ Error: ${err.message}`);
-    res.status(500).send('Internal Server Error');
+    logger.error(`❌ Campaign error: ${err.message}`);
+  } finally {
+    campaignStatus.running = false;
   }
+}
+
+// Start campaign API
+app.get('/start-campaign', async (req, res) => {
+  if (campaignStatus.running) {
+    return res.status(400).send('⚠️ Campaign is already running');
+  }
+
+  const batchSize = parseInt(req.query.batchSize) || 100;
+
+  logger.info('🔁 Campaign triggered');
+  setImmediate(() => runCampaign(batchSize)); // Run in background
+
+  res.send(`📤 Campaign started in background (batchSize: ${batchSize})`);
+});
+
+// Status check API
+app.get('/campaign-status', (req, res) => {
+  res.json(campaignStatus);
 });
 
 app.listen(PORT, () => {
-  logger.info(`Server started on port ${PORT}`);
+  logger.info(`🚀 Server running on port ${PORT}`);
 });
